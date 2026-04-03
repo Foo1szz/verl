@@ -97,14 +97,35 @@ class ServerAdapter(BaseRollout):
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
 
-        self.use_shm = not is_support_ipc()
+        force_use_shm_env = os.getenv("VERL_VLLM_WEIGHT_SYNC_USE_SHM")
+        force_use_shm_config = None
+        if isinstance(self.config.custom, dict):
+            force_use_shm_config = self.config.custom.get("weight_transfer_use_shm")
+
+        if force_use_shm_env is not None:
+            self.use_shm = force_use_shm_env.strip().lower() in {"1", "true", "yes", "on"}
+            use_shm_reason = "environment variable VERL_VLLM_WEIGHT_SYNC_USE_SHM"
+        elif force_use_shm_config is not None:
+            self.use_shm = bool(force_use_shm_config)
+            use_shm_reason = "rollout.custom.weight_transfer_use_shm"
+        else:
+            self.use_shm = not is_support_ipc()
+            use_shm_reason = None
+
         if self.use_shm:
-            logger.warning(
-                "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
-                "which may cause performance degradation. If you are using Ascend NPUs, please ensure that "
-                "your software and CANN toolkit versions meet the requirements for IPC support. (Ascend HDK version "
-                ">= 25.3.rc1 and CANN toolkit version >= 8.3.RC1)"
-            )
+            if use_shm_reason is not None:
+                logger.warning(
+                    "Using shared memory for vLLM weight transfer because %s requested it. "
+                    "This is slower than CUDA IPC but can be more stable on some systems.",
+                    use_shm_reason,
+                )
+            else:
+                logger.warning(
+                    "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
+                    "which may cause performance degradation. If you are using Ascend NPUs, please ensure that "
+                    "your software and CANN toolkit versions meet the requirements for IPC support. (Ascend HDK version "
+                    ">= 25.3.rc1 and CANN toolkit version >= 8.3.RC1)"
+                )
 
     async def _execute_method(
         self,
