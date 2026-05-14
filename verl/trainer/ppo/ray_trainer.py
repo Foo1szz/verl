@@ -510,6 +510,55 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
+    def _reward_requires_batch_context(self) -> bool:
+        return bool(getattr(self.reward_loop_manager.reward_manager_cls, "requires_batch_context", False))
+
+    def _reward_needs_token_entropy(self) -> bool:
+        reward_kwargs = self.config.reward.get("custom_reward_function", {}).get("reward_kwargs", {})
+        return bool(reward_kwargs.get("use_token_entropy", False))
+
+    def _add_response_token_entropy(self, batch: DataProto, entropys: torch.Tensor) -> None:
+        response_masks = batch.batch["response_mask"]
+        response_entropy = masked_mean(entropys, response_masks, axis=-1).detach().cpu().numpy()
+        response_token_count = response_masks.sum(dim=-1).detach().cpu().numpy()
+        batch.non_tensor_batch["response_token_entropy"] = response_entropy
+        batch.non_tensor_batch["response_token_count"] = response_token_count
+
+    def _select_rollouts_per_prompt(self, batch: DataProto, keep_n: int) -> DataProto:
+        if keep_n <= 0:
+            return batch
+        uids = batch.non_tensor_batch.get("uid")
+        if uids is None:
+            raise ValueError("uid is required when reward.keep_rollouts_per_prompt is set.")
+
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_indices[str(uid)].append(idx)
+
+        if any(len(indices) < keep_n for indices in uid_to_indices.values()):
+            min_group_size = min(len(indices) for indices in uid_to_indices.values())
+            raise ValueError(
+                f"Cannot keep {keep_n} rollouts per prompt because the smallest prompt group has {min_group_size}."
+            )
+
+        rng = np.random.default_rng(seed=self.global_steps)
+        selected_indices = []
+        for uid in sorted(uid_to_indices):
+            indices = np.asarray(uid_to_indices[uid], dtype=np.int64)
+            if len(indices) > keep_n:
+                indices = np.sort(rng.choice(indices, size=keep_n, replace=False))
+            selected_indices.extend(indices.tolist())
+
+        selected_batch = batch.select_idxs(selected_indices)
+        selected_batch.meta_info["global_token_num"] = torch.sum(
+            selected_batch.batch["attention_mask"], dim=-1
+        ).tolist()
+        return selected_batch
+
+    def _get_keep_rollouts_per_prompt(self) -> int:
+        reward_kwargs = self.config.reward.get("custom_reward_function", {}).get("reward_kwargs", {})
+        return int(reward_kwargs.get("keep_rollouts_per_prompt", 0))
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -556,7 +605,11 @@ class RayPPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            if (
+                self.use_rm
+                and not self._reward_requires_batch_context()
+                and "rm_scores" not in test_output_gen_batch_padded.batch.keys()
+            ):
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
@@ -568,6 +621,10 @@ class RayPPOTrainer:
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            if self._reward_requires_batch_context() and "rm_scores" not in test_output_gen_batch.batch.keys():
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch)
+                test_output_gen_batch = test_output_gen_batch.union(batch_reward)
 
             print("validation generation end")
 
@@ -638,27 +695,17 @@ class RayPPOTrainer:
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
+        single_data_source = len(data_src2var2metric2val) == 1
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
-
-        if len(sample_turns) > 0:
-            sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+            if core_var not in var2metric2val:
+                continue
+            metric2val = var2metric2val[core_var]
+            n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+            metric_name = f"mean@{n_max}"
+            if metric_name in metric2val:
+                metric_key = "val/acc" if single_data_source else f"val/{data_source}/acc"
+                metric_dict[metric_key] = metric2val[metric_name]
 
         return metric_dict
 
@@ -850,7 +897,10 @@ class RayPPOTrainer:
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        enable_agent_reward_loop = (
+            not self._reward_requires_batch_context()
+            and (not self.use_rm or self.config.reward.reward_model.enable_resource_pool)
+        )
 
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
@@ -1384,7 +1434,9 @@ class RayPPOTrainer:
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            if (self.use_rm or self._reward_requires_batch_context()) and (
+                                "rm_scores" not in batch.batch.keys()
+                            ):
                                 batch_reward = self._compute_reward_colocate(batch)
                                 batch = batch.union(batch_reward)
 
@@ -1421,14 +1473,23 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
+                    reward_needs_token_entropy = self._reward_needs_token_entropy()
+                    if not reward_needs_token_entropy:
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if (self.use_rm or self._reward_requires_batch_context()) and (
+                                "rm_scores" not in batch.batch.keys()
+                            ):
+                                batch_reward = self._compute_reward_colocate(batch)
+                                batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                        keep_rollouts_per_prompt = self._get_keep_rollouts_per_prompt()
+                        if keep_rollouts_per_prompt > 0:
+                            batch = self._select_rollouts_per_prompt(batch, keep_rollouts_per_prompt)
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1444,6 +1505,8 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                        if reward_needs_token_entropy:
+                            raise ValueError("Token-level entropy reward is not available with rollout bypass mode.")
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -1461,6 +1524,8 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            if reward_needs_token_entropy:
+                                self._add_response_token_entropy(batch, entropys)
                             old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
@@ -1478,6 +1543,23 @@ class RayPPOTrainer:
                                 metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                    if reward_needs_token_entropy:
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if (self.use_rm or self._reward_requires_batch_context()) and (
+                                "rm_scores" not in batch.batch.keys()
+                            ):
+                                batch_reward = self._compute_reward_colocate(batch)
+                                batch = batch.union(batch_reward)
+
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                        keep_rollouts_per_prompt = self._get_keep_rollouts_per_prompt()
+                        if keep_rollouts_per_prompt > 0:
+                            batch = self._select_rollouts_per_prompt(batch, keep_rollouts_per_prompt)
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1498,6 +1580,20 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            keys_to_log = {
+                                "acc",
+                                "complementary_hit",
+                                "pseudo_label_available",
+                                "pseudo_label_matches_gold",
+                            }
+                            for key, values in reward_extra_infos_dict.items():
+                                if key not in keys_to_log:
+                                    continue
+                                try:
+                                    numeric_values = np.asarray(values, dtype=np.float32)
+                                except (TypeError, ValueError):
+                                    continue
+                                metrics[f"reward_extra/{key}/mean"] = float(np.mean(numeric_values))
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

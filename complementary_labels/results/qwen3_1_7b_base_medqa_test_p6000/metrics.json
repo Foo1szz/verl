@@ -1,0 +1,7 @@
+{
+  "total": 1273,
+  "correct": 470,
+  "accuracy": 0.3692065985860173,
+  "predictions_file": "/data/home/yanghj/code/verl/complementary_labels/results/qwen3_1_7b_base_medqa_test_p6000/predictions.jsonl",
+  "finished_at": "2026-05-12T04:22:49.132026+00:00"
+}

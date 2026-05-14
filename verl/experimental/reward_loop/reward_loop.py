@@ -136,6 +136,10 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        run_batch = getattr(self.reward_manager, "run_batch", None)
+        if callable(run_batch):
+            return await run_batch(data)
+
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
@@ -143,6 +147,12 @@ class RewardLoopWorker:
         return outputs
 
     async def compute_score(self, data: DataProto) -> dict:
+        if getattr(self.reward_manager, "requires_batch_context", False):
+            raise RuntimeError(
+                f"{type(self.reward_manager).__name__} requires batch-level reward computation, "
+                "but it was called for a single agent-loop trajectory."
+            )
+
         if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
             return await self.reward_manager.run_single(data)
@@ -324,14 +334,17 @@ class RewardLoopManager:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
-        outputs_flat = [item for sublist in outputs for item in sublist]
+        if getattr(self.reward_manager_cls, "requires_batch_context", False):
+            outputs_flat = ray.get(self.reward_loop_workers[0].compute_score_batch.remote(data))
+        else:
+            chunks = data.chunk(len(self.reward_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.compute_score_batch.remote(chunk)
+                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+                ]
+            )
+            outputs_flat = [item for sublist in outputs for item in sublist]
 
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
