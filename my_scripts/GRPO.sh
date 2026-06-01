@@ -42,7 +42,7 @@ ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
 KL_LOSS_TYPE=${KL_LOSS_TYPE:-low_var_kl}
-TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-50}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
 
 # Operational defaults not specified by the paper.
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
@@ -58,8 +58,8 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-100}
 VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-False}
 LOGGER=${LOGGER:-'["console","wandb"]'}
 RESUME_MODE=${RESUME_MODE:-auto}
-MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-1}
-MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP:-1}
+MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-2}
+MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP:-2}
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-True}
 ACTOR_PARAM_OFFLOAD=${ACTOR_PARAM_OFFLOAD:-False}
 ACTOR_OPTIMIZER_OFFLOAD=${ACTOR_OPTIMIZER_OFFLOAD:-False}
@@ -131,8 +131,9 @@ REF=(
 )
 
 REWARD=(
-    reward_model.reward_manager=naive
-    custom_reward_function.path=null
+    reward.reward_manager.name=naive
+    reward.custom_reward_function.path=null
+    reward.custom_reward_function.name=compute_score
 )
 
 TRAINER=(

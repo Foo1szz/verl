@@ -178,6 +178,17 @@ class vLLMHttpServer:
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
+    def _release_reserved_ports(self):
+        """Release reservation sockets before vLLM binds the selected ports."""
+        for attr in ("_master_sock", "_dp_rpc_sock", "_dp_master_sock"):
+            sock = getattr(self, attr, None)
+            if sock is None:
+                continue
+            try:
+                sock.close()
+            finally:
+                setattr(self, attr, None)
+
     @property
     def lora_as_adapter(self) -> bool:
         return (
@@ -383,6 +394,7 @@ class vLLMHttpServer:
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        self._release_reserved_ports()
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -423,6 +435,7 @@ class vLLMHttpServer:
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
         args.api_server_count = 0
+        self._release_reserved_ports()
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
